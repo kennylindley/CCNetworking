@@ -1,0 +1,15 @@
+-- Networking
+-- all of the initialization for networking
+-- v.01
+
+local config_path = "/sys/conf/network.config"
+
+function __init__()
+  if fs.exists(config_path) then
+    local f = fs.open(config_path, "r")
+    local m = textutils.unserialize(f.realAll())
+    for iface, settings in pairs(m) do
+      ipv4_initialize(iface, settings.ip_address, settings.netmask, settings.gateway)
+    end
+  end
+end

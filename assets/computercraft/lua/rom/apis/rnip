@@ -1,0 +1,574 @@
+----------------------------------------
+-- RNIP
+-- v0.1
+----------------------------------------
+
+-- CONSTANTS
+-- List of constants
+	log_file = fs.open("/log.txt", "w")
+-- FILTERING
+ETHERNET = 1
+ARP = 2
+IPV4 = 3
+
+DISABLED = 0
+ENABLED = 1
+PROMISCUOUS = 2
+
+-- Hardware Layer (1)
+CHANNEL = 9088
+
+MAC = os.getComputerID()
+MAC_BROADCAST = 9099 -- The broadcast channel
+
+-- Ethernet info (Network Layer)
+ETHERNET_TEMPLATE = {source=0, target=0, ethertype=2048, payload=""}
+ETHERNET_TYPE_IPV4 = 0x0800
+ETHERNET_TYPE_ARP = 0x0806
+
+-- ARP Layers 2 and 3
+ARP_TEMPLATE = {protocol=2048, operation=1, sha=0, spa="", tha=0, tpa=""}
+APR_REQUEST = 1
+ARP_REPLY = 2
+
+-- IPv4 (Data Link Layer)
+IPV4_TEMPLATE = {ttl=128, protocol=17, source="", destination="", payload=""}
+IPV4_BROADCAST = "255.255.255.255"
+IPV4_LOCALHOST = "127.0.0.1"
+IPV4_PROTOCOL_ICMP = 1
+IPV4_PROTOCOL_TCP = 6
+IPV4_PROTOCOL_UDP = 17
+IPV4_DEFAULT_TTL = 128
+
+--TCP
+TCP_TEMPLATE = {port=0, seq=0, syn_flag=false, ack_flag=false, fin_flag=false, rst_flag=false, payload=""}
+TCP_STATE_LISTEN = 1
+TCP_STATE_SYN_SENT = 2
+TCP_STATE_SYN_RECEIVED = 3
+TCP_STATE_ESTABLISHED = 4
+TCP_STATE_FIN_WAIT_1 = 5
+TCP_STATE_FIN_WAIT_2 = 6
+TCP_STATE_CLOSE_WAIT = 7
+TCP_STATE_LAST_ACK = 8
+TCP_STATE_TIME_WAIT = 9
+TCP_STATE_CLOSED = 10
+
+-- ICMP
+ICMP_TEMPLATE = {type=8, code=0, payload=""}
+ICMP_TYPE_ECHO_REPLY = 0
+ICMP_TYPE_DESTINATION_UNREACHABLE = 3
+ICMP_TYPE_ECHO = 8
+ICMP_TYPE_TIME_EXCEEDED = 11
+ICMP_TEMPLATE_ECHO = {identifier = 0, sequence = 0, payload = ""}
+
+
+SOCKET_TEMPLATE = {local_address="", remote_address="", local_port=0, remote_port=0, state=TCP_STATE_CLOSED, seq=0, protocol=IPV4_PROTOCOL_TCP}
+-- END CONSTANTS
+
+-- Runtime variables
+interfaces = {} -- associates interface names with modems
+interface_sides = {} -- associates block sides with interface names
+default_interface = nil -- first interface initialized
+packet_filters = {} -- protocol type
+
+ipv4_packet_queue = {}
+
+-- Networking variables
+arp_cache = {}
+
+ipv4_interfaces = {}
+ipv4_routes = {}
+
+sockets = {} -- {local_address, remote_address, local_port, remote_port, state=<state>, seq=<random_seq_number>, protocol=<protocol>}
+
+icmp_echo_identifier = 42
+icmp_echo_sequence = 0
+
+socket_id = 0
+listener_id = 0
+
+function initialize()
+	local SIDES = {"front", "back", "top", "bottom", "left", "right"}
+	local wired, wireless = 0,0
+	
+	for i, side in ipairs(SIDES) do
+		local device = peripheral.wrap(side)
+		
+		if device ~= nil then
+			local interface = nil
+			
+			if peripheral.getType(side) == "modem" then
+				if device.isWireless() then
+					interface = "wlan"..wireless
+					wireless = wireless + 1
+				else
+					interface = "eth"..wired
+					wired = wired + 1
+				end
+				
+				device.open(CHANNEL)
+			end
+			
+			if interface ~= nil then
+				if default_interface == nil then
+					default_interface = interface
+					interfaces["default"] = device
+				end
+				
+				interfaces[interface] = device
+				interface_sides[side] = interface
+			end
+		end
+	end
+end
+
+function stop()
+	for interface, modem in interfaces do
+		modem.close(CHANNEL)
+	end
+	
+	interfaces = {}
+end
+
+function send_raw (interface, frame)
+	if interface == "default" then
+		interface = default_interface
+	end
+	
+	interfaces[interface].transmit(CHANNEL, CHANNEL, frame)
+end
+
+function receive_raw()
+	local event, side, message, distance
+	
+	parallel.waitForAny(
+		function()
+			event, side, _, _, message, distance = os.pullEventRaw("modem_message")
+		end
+	)
+	
+	local packet = textutils.unserialize(message)
+	
+	local interface = get_interface(side)
+	
+	ethernet_event(interface, packet)
+	
+	return interface, packet
+end
+
+function loop()
+
+	while true do
+		local interface, packet = receive_raw()
+		local send = false
+		
+		for protocol, state in pairs(packet_filters) do
+			if state ~= DISABLED then
+				if protocol == ETHERNET then
+					if packet.target == MAC or state == PROMISCUOUS then send = true end
+				elseif protocol == ARP then
+					if packet.ethertype == ETHERNET_TYPE_ARP then
+						if packet.payload.tha == MAC
+							or packet.payload.tpa == ipv4_interfaces[interface]
+							or state == PROMISCUOUS then send = true end
+					end
+				elseif protocol == IPV4 then
+					print("IPV4")
+					if packet.target == MAC and packet.ethertype == ETHERNET_TYPE_IPV4 then
+						print("IPV4-2")
+						if (packet.payload.destination == ipv4_interfaces[interface] or packet.payload.destination == IPV4_BROADCAST)
+							or state == PROMISCUOUS then 
+								print("IPV4-3")
+								send = true 
+							end
+					end
+				elseif protocol == ICMP then
+					if packet.ethertype == ETHERNET_TYPE_IPV4 and packet.payload.protocol == IPV4_PROTOCOL_ICMP then
+						if (packet.payload.destination == ipv4_interfaces[interface] or packet.payload.destination == IPV4_BROADCAST)
+							or state == PROMISCUOUS then send = true end
+					end
+				end
+			end
+		end
+		
+		if send then os.queueEvent("rnip", interface, packet) end
+		
+	end
+end
+
+function get_interface(side) 
+	return interface_sides[side]
+end
+
+function filter (protocol, state)
+	packet_filters[protocol] = state
+end
+
+--[[function run (user_function)
+	parallel.waitForAny(
+		function()
+			user_function()
+		end,
+		function()
+			loop()
+		end
+	)
+end
+]]--
+
+function ethernet_send(interface, target, type, message)
+	local frame = ETHERNET_TEMPLATE
+	frame.source = MAC
+	frame.target = target
+	frame.ethertype = type
+	frame.payload = message
+	
+	log_file.write("Sent: "..textutils.serialize(frame))
+	log_file.flush()
+	send_raw(interface, textutils.serialize(frame))
+	
+end
+
+function ethernet_event(interface, frame)
+	log_file.write("Received: "..textutils.serialize(frame))
+	log_file.flush()
+	if frame.ethertype == ETHERNET_TYPE_ARP then
+		arp_event(interface, frame, frame.payload)
+	elseif frame.ethertype == ETHERNET_TYPE_IPV4 then
+		print("got IPV4")
+		ipv4_event(interface, frame, frame.payload)
+	end
+end
+
+-- ARP
+function arp_send(interface, protocol, operation, sha, spa, tha, tpa)
+	local packet = ARP_TEMPLATE
+	packet.protocol = protocol
+	packet.operation = operation
+	packet.sha = sha
+	packet.spa = spa
+	packet.tha = tha
+	packet.tpa = tpa
+	
+	ethernet_send(interface, (operation == ARP_REQUEST and MAC_BROADCAST or tha), ETHERNET_TYPE_ARP, packet)
+end
+
+function arp_request (interface, tpa)
+	if arp_cache[tpa] == nil then
+		arp_send(interface, ETHERNET_TYPE_IPV4, ARP_REQUEST, MAC, ipv4_interfaces[interface], 0, tpa)
+	end
+end
+
+function arp_reply(interface, tha, tpa)
+	arp_send(interface, ETHERNET_TYPE_IPV4, ARP_REPLY, MAC, ipv4_interfaces[interface], tha, tpa)
+end
+
+function arp_event(interface, raw, arp)
+	if arp.operation == ARP_REQUEST then
+		if arp.tpa == ipv4_interfaces[interface] then
+			arp_reply(interface, arp.sha, arp.spa)
+		end
+		
+	end
+	arp_cache[arp.spa] = arp.sha
+	--print(textutils.serialize(arp_cache))
+	ipv4_process_queue()
+	
+end
+
+-- IPV4
+function ipv4_initialize(interface, address, subnet, gateway)
+	if interface == "default" or interface == default_interface then
+		ipv4_interfaces["default"] = addres
+		interface = default_interface
+	end
+	
+	ipv4_interfaces[interface] = address
+	
+	arp_cache[IPV4_BROADCAST] = MAC_BROADCAST
+	arp_cache[address] = MAC
+	
+	prefix = 32 - math.ceil(math.log10(bit.bxor(math.pow(2, 32) - 1, ip_to_binary(subnet))) / math.log10(2))
+	route_add(address.."/"..prefix, IPV4_BROADCAST, interface)
+	route_add("0.0.0.0/0", gateway, interface)
+end
+
+function ipv4_send (destination, protocol, ttl, payload)
+	dest_binary = ip_to_binary(destination)
+	
+	route_choice = { netmask = -1 }
+	for cidr, route in pairs(ipv4_routes) do
+		if bit.band(dest_binary, route.netmask) == route.network and route.netmask > route_choice.netmask then
+			route_choice = route
+		end
+		
+	end
+	
+	interface = route_choice.interface
+	hostdestination = route_choice.route
+	--print("hostdestination: "..tostring(hostdestination))
+	if hostdestination == IPV4_BROADCAST then hostdestination = destination end
+	
+	if arp_cache[hostdestination] == nil then
+		local data = {interface = interface, destination = destination, port=port, protocol = protocol, ttl = ttl, payload = payload}
+		
+		arp_request(interface, destination)
+		if ipv4_packet_queue == nil then ipv4_packet_queue = {} end
+		table.insert(ipv4_packet_queue, textutils.serialize(data))
+		
+		return
+	end
+	
+	local packet = IPV4_TEMPLATE
+	packet.source = ipv4_interfaces[interface]
+	packet.destination = destination
+	packet.protocol = protocol
+	packet.ttl = ttl
+	packet.payload = payload
+	packet.port = port
+	
+	ethernet_send(interface, arp_cache[hostdestination], ETHERNET_TYPE_IPV4, packet)
+end	
+
+function ipv4_process_queue ()
+	--print("Packet queue: "..textutils.serialize(ipv4_packet_queue))
+	if ipv4_packet_queue ~= nil then
+		for i, queue_packet in ipairs(ipv4_packet_queue) do
+			local data = textutils.unserialize(queue_packet)
+				ipv4_send(data.destination, data.port, data.protocol, data.ttl, data.payload)
+			if arp_cache[data.destination] ~= nil then
+				table.remove(ipv4_packet_queue, i)
+			end
+		end
+	end
+end
+
+function ipv4_event(interface, raw, ipv4)
+	raw.payload.ttl = raw.payload.ttl - 1
+	ipv4 = raw.payload
+	
+	if raw.payload.ttl == 0 then
+		icmp_send(raw.payload.source, IPV4_DEFAULT_TTL, ICMP_TYPE_TIME_EXCEEDED, 0, "")
+		return
+	end
+	
+	arp_cache[ipv4.source] = raw.source
+	
+	if ipv4.protocol == 1 then
+		print("got ICMP")
+		icmp_event(interface, raw, ipv4.payload)
+	elseif ipv4.protocol == IPV4_PROTOCOL_TCP then
+	  tcp_event(interface, raw, ipv4.payload)
+	 end
+end
+
+function ip_to_binary(address)
+	a, b, c, d = string.match(address, "(%d+).(%d+).(%d+).(%d+)")
+	return (bit.blshift(tonumber(a), 24))
+			+ (bit.blshift(tonumber(b), 16))
+			+ (bit.blshift(tonumber(c), 8))
+			+ tonumber(d)
+end
+
+function route_add(cidr, route, interface)
+	network, prefix = string.match(cidr, "(.+)/(%d+)")
+	
+	--print(tostring(prefix))
+	
+	netmask = bit.bxor(math.pow(2, 32 - tonumber(prefix)) - 1, math.pow(2, 32) - 1)
+	network_short = bit.band(ip_to_binary(network), netmask)
+	
+	ipv4_routes[cidr] = {
+		route = route,
+		interface = interface,
+		network = network_short,
+		netmask = netmask
+	}
+end
+
+function route_remove(cidr)
+	ipv4_routes[cidr] = nil
+end
+
+-- ICMP
+function icmp_send(destination, ttl, type, code, payload)
+	local packet = ICMP_TEMPLATE
+	packet.type = type
+	packet.code = code
+	packet.payload = payload
+	
+	ipv4_send(destination, IPV4_PROTOCOL_ICMP, ttl, packet)
+end
+
+function icmp_ping_ttl(destination, ttl)
+	local packet = ICMP_TEMPLATE_ECHO
+	packet.identifier = icmp_echo_identifier
+	packet.sequence = icmp_echo_sequence
+	packet.payload = os.clock()
+	
+	icmp_send(destination, ttl, ICMP_TYPE_ECHO, 0, packet)
+	
+	icmp_echo_sequence = icmp_echo_sequence + 1
+	
+end
+
+function icmp_ping(interface, destination)
+	icmp_ping_ttl(interface, destination, IPV4_DEfAULT_TTL)
+end
+
+function icmp_event(interface, raw, icmp)
+	if icmp.type == ICMP_TYPE_ECHO then
+		local packet = ICMP_TEMPLATE_ECHO
+		packet.identifier = icmp.payload.identifier
+		packet.sequence = icmp.payload.sequence
+		packet.payload = icmp.payload.payload
+		
+		icmp_send(raw.payload.source, raw.payload.ttl, ICMP_TYPE_ECHO_REPLY, 0, packet)
+	end
+end
+
+-- TCP
+
+function tcp_find_open_port()
+	for i = 8000 to 65535 do
+		if sockets[i] == nil then
+			return i
+		end
+	end
+end
+
+function tcp_create_packet(port, payload)
+	local packet = TCP_TEMPLATE
+	packet.remote_port = sockets[port].remote_port
+	packet.lo
+	packet.seq = sockets[port].seq
+	packet.payload = payload
+	return packet
+end
+
+function socket_create(remote_address, remote_port, local_port, protocol, listener)
+	-- first, is the local port available to create a socket on
+	if sockets[local_port] == nil then
+		-- it is, create the socket
+		local socket = SOCKET_TEMPLATE
+		socket.remote_address = remote_address
+		socket.remote_port = remote_port
+		socket.local_port = local_port
+		socket.protocol = IPV4_PROTOCOL_TCP
+		socket.seq = math.random(65535)
+		if listener then
+			socket.state = TCP_STATE_LISTEN
+		end
+		sockets[local_port] = socket
+		return local_port
+	end
+end
+
+function socket_open(dest, port)
+	socket_create(dest, port, port, IPV4_PROTOCOL_TCP, false)
+	-- begin the TCP handshake
+	local packet = tcp_create_packet(port)
+	packet.syn_flag = true
+	ipv4_send(dest, IPV4_PROTOCOL_TCP, IPV4_DEFAULT_TTL, packet)
+end
+
+function socket_event(interface, raw, tcp)
+	if sockets[tcp.port].state == TCP_STATE_LISTEN then
+		-- any flags?
+		-- the only flag valid in this state is SYN, ignore otherwise
+		if tcp.syn_flag then
+			-- client is trying to connect
+			-- determine what port to use, create a socket
+			local local_port = socket_create(raw.payload.source, raw.payload.source_port, tcp_find_open_port(), IPV4_PROTOCOL_TCP, false)
+			
+			-- got a socket, create the SYN/ACK packet
+			local my_packet = tcp_create_packet(local_port)
+			my_packet.syn_flag = true
+			my_packet.ack_flag = true
+			ipv4_send(raw.payload.source, IPV4_PROTOCOL_TCP, IPV4_DEFAULT_TTL, my_packet)
+			
+			--Change the socket state to SYN_RECEIVED
+			sockets[local_port].state = TCP_STATE_SYN_RECEIVED
+		end
+		-- nothing else to do for this one
+	elseif sockets[tcp.remote_port].state == TCP_STATE_SYN_SEND then
+		-- This is client side, the only thing that the client can receive at this point is a SYN/ACK
+		if tcp.syn_flag and tcp.ack_flag then
+			if tcp.local_port ~= tcp.remote_port then
+				sockets[tcp.remote_port].remote_port = tcp.local_port
+				-- This sets the remote_port on the client to be the local_port sent by the server.
+				-- Now create an ACK packet to complete the handshake
+				local my_packet = tcp_create_packet(tcp.remote_port)
+				my_packet.ack_flag = true
+				ipv4_send(raw.payload.source, IPV4_PROTOCOL, IPV4_DEFAULT_TTL, my_packet)
+				
+				-- Change this socket state to ESTABLISHED
+				sockets[tcp.remote_port].state = TCP_STATE_ESTABLISHED
+		end
+	elseif sockets[tcp.port].state == TCP_STATE_SYN_RECEIVED then
+		-- This is server side, SYN/ACK has been sent, now we await the ACK
+		if tcp.ack_flag then
+			-- all good, set the socket to ESTABLISHED
+			sockets[tcp.remote_port].state = TCP_STATE_ESTABLISHED
+		end
+	elseif sockets[tcp.port].state == TCP_STATE_ESTABLISHED then
+		-- queue the event to be handled by the OS.
+		os.queueEvent("socket_received", raw)
+	elseif sockets[tcp.port].state == TCP_STATE_FIN_WAIT_1 then
+		-- This state is reached when we have sent FIN. The only possibility is to receive FIN/ACK
+		if tcp.fin_flag and tcp.ack_flag then
+			-- send back an ACK
+			local my_packet = tcp_create_packet(tcp.remote_port)
+			my_packet.ack_flag = true
+			ipv4_send(raw.payload.source, IPV4_PROTOCOL, IPV4_DEFAULT_TTL, my_packet)
+			
+			-- set the port to TIME_WAIT
+			sockets[tcp.remote_port].state = TCP_STATE_TIME_WAIT
+			parallel.waitForAny(function()
+				os.sleep(2)
+				socket_close(tcp.remote_port)
+			end)
+		end
+	
+	elseif sockets[tcp.port].state == TCP_STATE_CLOSE_WAIT then
+		-- We have received a FIN message, send FIN/ACK			
+		local my_packet = tcp_create_packet(tcp.remote_port)
+		my_packet.ack_flag = true
+		ipv4_send(raw.payload.source, IPV4_PROTOCOL, IPV4_DEFAULT_TTL, my_packet)
+		
+		-- Change socket state to LAST_ACK	
+		sockets[tcp.remote_port].state = TCP_STATE_LAST_ACK
+		
+	elseif sockets[tcp.port].state == TCP_STATE_LAST_ACK then
+		-- we are awaiting the final ACK from the remote
+		if tcp.ack_flag then
+			-- Close the socket
+			socket_close(tcp.remote_port)
+		end
+	elseif sockets[tcp.port].state == TCP_STATE_TIME_WAIT then
+		
+	elseif sockets[tcp.port].state == TCP_STATE_CLOSED then
+		-- Socket is CLOSED
+		-- send the RST packet
+		local my_packet = tcp
+		local my_packet.rst_flag = true
+		ipv4_send(tcp.source, IPV4_PROTOCOL_TCP, IPV4_DEFAULT_TTL, my_packet)
+	end
+end
+
+function socket_send(remote_port, payload)
+	if sockets[remote_port].state == TCP_STATE_ESTABLISHED then
+		local my_packet = tcp_create_packet(remote_port, payload)
+		ipv4_send(my_packet[destination], IPV4_PROTOCOL_TCP, IPV4_DEFAULT_TTL, my_packet)
+	end
+end
+
+function socket_close(p)
+	sockets[p] = SOCKET_TEMPLATE
+end
+
+function create_sockets()
+	for i = 1 to 65535 do
+		sockets[i] = SOCKET_TEMPLATE
+	end
+end
